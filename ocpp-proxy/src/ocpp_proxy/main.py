@@ -22,6 +22,7 @@ _charger_info: dict = {
     "model": None,
     "last_id_tag": None,
     "last_status": None,
+    "evcc_status": "A",
     "firmware": None,
     "serial": None,
 }
@@ -108,7 +109,18 @@ def _sniff(raw: str) -> None:
             _charger_info["serial"] = payload.get("chargePointSerialNumber")
 
         if action == "StatusNotification":
-            _charger_info["last_status"] = payload.get("status")
+            ocpp_status = payload.get("status", "")
+            _charger_info["last_status"] = ocpp_status
+            _charger_info["evcc_status"] = {
+                "Available": "A",
+                "Preparing": "B",
+                "Charging": "C",
+                "SuspendedEV": "B",
+                "SuspendedEVSE": "B",
+                "Finishing": "B",
+                "Faulted": "F",
+                "Unavailable": "A",
+            }.get(ocpp_status, "A")
 
         if action == "StopTransaction":
             meter_stop = payload.get("meterStop")
