@@ -38,7 +38,7 @@ With sniffer:
   evcc ──HTTP──► OCPP Sniffer  (RFID tag, meter data, direct control)
 ```
 
-Every OCPP message is forwarded to Wattify **unchanged**. Wattify remains in full
+Every OCPP message is forwarded to your CPO **unchanged**. The CPO remains in full
 control of authorization and billing. The sniffer only reads and exposes data.
 
 ## What the sniffer captures
@@ -79,7 +79,7 @@ Change your charger's OCPP URL to point to the sniffer instead of your CPO.
 
 | Setting | Old value | New value |
 |---|---|---|
-| OCPP URL | `wss://cpo.wattify.be/ocpp/1305884` | `wss://ocpp.yourdomain.com/charger` |
+| OCPP URL | `wss://your-cpo-endpoint/ocpp/YOUR_ID` | `wss://ocpp.yourdomain.com/charger` |
 | Identity | `1305884` | `1305884` (unchanged) |
 | Password | (empty) | your `charger_password` |
 
@@ -357,10 +357,9 @@ automatically selects the right vehicle and charging schedule.
 **One upstream only.** The sniffer forwards to exactly one CPO. Multiple backends
 are not supported and not planned.
 
-**Wattify controls auth.** If your CPO uses a local authorization list
-(`SendLocalList`), the charger may authorize locally without sending `Authorize`
-over the wire. The RFID tag still appears in `StartTransaction` when the car is
-plugged in.
+**Local authorization lists.** If your CPO uses `SendLocalList`, the charger may
+authorize locally without sending `Authorize` over the wire. The RFID tag still
+appears in `StartTransaction` when the car is plugged in.
 
 **MeterValues appear only during charging.** The `/meter_values` endpoint returns
 zeros until a charging session starts and the charger sends `MeterValues`.
