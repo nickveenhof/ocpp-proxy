@@ -55,11 +55,6 @@ _active_charger_ws = None
 _pending_responses: dict = {}
 
 
-_api_token: str = ""
-
-EXEMPT_PATHS = {"/charger", "/"}
-
-
 @web.middleware
 async def log_all_requests(request, handler):
     real_ip = request.headers.get(
@@ -74,20 +69,6 @@ async def log_all_requests(request, handler):
         request.headers.get("Sec-WebSocket-Protocol", ""),
         request.headers.get("User-Agent", ""),
     )
-    return await handler(request)
-
-
-@web.middleware
-async def auth_middleware(request, handler):
-    if not _api_token:
-        return await handler(request)
-    path = request.path
-    if path in EXEMPT_PATHS or path.startswith("/charger/"):
-        return await handler(request)
-    auth = request.headers.get("Authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
-    if token != _api_token:
-        return web.json_response({"error": "unauthorized"}, status=401)
     return await handler(request)
 
 
@@ -462,19 +443,13 @@ async def welcome_handler(_request: web.Request) -> web.Response:
 
 
 async def init_app() -> web.Application:
-    global _api_token
     config = Config()
-    _api_token = config.api_token
-    if _api_token:
-        _LOGGER.info("API token configured: auth required on all non-charger endpoints")
-    else:
-        _LOGGER.warning("No API token set: all REST endpoints are public")
     if config.charger_password:
         _LOGGER.info("Charger password configured: only authenticated chargers accepted")
     else:
         _LOGGER.warning("No charger password set: any charger can connect")
 
-    app = web.Application(middlewares=[log_all_requests, auth_middleware])
+    app = web.Application(middlewares=[log_all_requests])
     app["config"] = config
     app["event_logger"] = EventLogger(db_path=os.getenv("LOG_DB_PATH", "usage_log.db"))
 

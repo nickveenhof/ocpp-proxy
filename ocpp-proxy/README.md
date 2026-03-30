@@ -38,7 +38,6 @@ charger_password: "your-charger-password"
 | Field | Required | Description |
 |---|---|---|
 | `upstream_url` | Yes | Your CPO OCPP endpoint (e.g. Wattify) |
-| `api_token` | Recommended | Bearer token for all REST endpoints. Set the same value in evcc `http` source headers. |
 | `charger_password` | Recommended | OCPP Basic Auth password. Set the same value in the Wallbox app OCPP password field. Rejects any charger connection without this password. |
 
 ## Charger setup
