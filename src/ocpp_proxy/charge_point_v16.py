@@ -32,14 +32,14 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         return "1.6"
 
     async def start(self) -> None:
-        """Initiate the BootNotification sequence and handle incoming messages."""
-        # Send BootNotification to charger (as charge point)
-        await self.call_boot_notification(
-            charge_point_model="EVProxy", charge_point_vendor="OCPPProxy"
-        )
-        # Keep the listener alive
+        """Listen for incoming OCPP messages from the charger (CSMS role)."""
+        import logging
+
+        _log = logging.getLogger(__name__)
         while True:
-            await asyncio.sleep(1)
+            message = await self._connection.recv()
+            _log.info("OCPP RX: %s", message)
+            await self.route_message(message)
 
     async def send_remote_start_transaction(self, connector_id: int, id_tag: str) -> bool:
         """Send RemoteStartTransaction command to charger."""
