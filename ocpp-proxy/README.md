@@ -1,10 +1,10 @@
 # OCPP Sniffer
 
-Transparent OCPP 1.6 proxy for Home Assistant. Sits between your charger and your CPO. Forwards all traffic unchanged. Captures RFID tags and meter data for evcc. Optionally controls charging via direct OCPP commands.
+Transparent OCPP 1.6 proxy for Home Assistant. Sits between your charger and your CPO. Forwards all traffic unchanged. Captures RFID tags and meter data for evcc.
 
 ## The problem
 
-You use evcc for solar charging. Your charger is managed by a CPO for billing via OCPP. evcc cannot see who plugged in (RFID tag), so it cannot select the right vehicle or schedule.
+Your charger is managed by a CPO for billing via OCPP. evcc cannot see who plugged in, so it cannot select the right vehicle or schedule.
 
 ## The solution
 
@@ -13,16 +13,49 @@ Charger ──wss──► OCPP Sniffer ──wss──► CPO  (billing unchang
                       │
                       ├── /charger_info   RFID tag, status
                       ├── /meter_values   power, energy, L1/L2/L3
-                      ├── /enable/{bool}  pause/resume via SetChargingProfile
-                      └── /maxcurrent/N   set max current via SetChargingProfile
+                      ├── /enable/{bool}  pause/resume (SetChargingProfile)
+                      └── /maxcurrent/N   set current (SetChargingProfile)
 evcc ──HTTP──► OCPP Sniffer
 ```
 
-The CPO stays in full control of authorization and billing. The sniffer reads OCPP traffic and injects SetChargingProfile commands for evcc control.
+## Install
+
+1. HA: **Settings > Add-ons > Add-on Store > ⋮ > Repositories**
+2. Add: `https://github.com/nickveenhof/ocpp-sniffer`
+3. Install **OCPP Sniffer**.
+
+## Config
+
+In the add-on Configuration tab, fill in:
+
+| Field | What to enter |
+|---|---|
+| upstream_url | Your CPO OCPP URL, e.g. `wss://cpo.example.com/ocpp/123456` |
+| charger_password | A password. Set the same in your charger's OCPP settings. |
+| min_current | Minimum charge current in amps. Default: `6`. |
+| auto_throttle | `true` (default). Sets 0A on plug-in. evcc controls when to start. |
+
+## Auto-throttle
+
+When enabled, the sniffer sets 0A immediately after `StartTransaction`. The CPO session starts (billing runs), but the charger draws no power. evcc decides when to charge via `/enable/true`.
+
+Without it, the charger starts at full power on plug-in. evcc reacts after 10-30 seconds.
+
+## Charger setup
+
+Your charger needs to reach the sniffer over WSS with a valid TLS cert. Use a Cloudflare Tunnel. See [CLOUDFLARE.md](CLOUDFLARE.md) for setup instructions.
+
+Then in your charger's OCPP settings:
+
+| Setting | Value |
+|---|---|
+| OCPP URL | `wss://ocpp.yourdomain.com/charger` |
+| Identity | your charger serial number |
+| Password | same as `charger_password` above |
 
 ## What gets captured
 
-| OCPP message | Captured | Endpoint |
+| OCPP message | Data | Endpoint |
 |---|---|---|
 | `BootNotification` | Vendor, model, firmware, serial | `/charger_info` |
 | `StatusNotification` | Status (A/B/C for evcc) | `/charger_info` |
@@ -32,210 +65,99 @@ The CPO stays in full control of authorization and billing. The sniffer reads OC
 | `MeterValues` | L1/L2/L3 voltage, current, power, energy | `/meter_values` |
 | `DataTransfer` | Vendor messages (last 20) | `/data_transfer` |
 
-## Install
-
-1. HA: **Settings > Add-ons > Add-on Store > ⋮ > Repositories**
-2. Add: `https://github.com/nickveenhof/ocpp-sniffer`
-3. Install **OCPP Sniffer**, configure, start.
-
-## Config
-
-```yaml
-upstream_url: "wss://your-cpo-endpoint/ocpp/YOUR_CHARGER_ID"
-charger_password: "your-password"
-min_current: 6
-auto_throttle: true
-```
-
-| Field | Required | Default | Description |
-|---|---|---|---|
-| `upstream_url` | Yes | | Your CPO OCPP WebSocket URL |
-| `charger_password` | Recommended | | OCPP Basic Auth password. Set the same value in your charger's OCPP password field. |
-| `min_current` | No | 6 | Minimum charge current in amps. Used by `/enable/true`. |
-| `auto_throttle` | No | true | On `StartTransaction`, immediately set current to 0A. Prevents charging until evcc sends `/enable/true`. |
-
-## Auto-throttle
-
-When `auto_throttle: true`, the sniffer injects a `SetChargingProfile` with 0A immediately after `StartTransaction`. The CPO starts the session (billing runs), but the charger draws no power. evcc decides when and how fast to charge via `/enable/true` and `/maxcurrent/{amps}`.
-
-Without auto-throttle, the charger starts at full power as soon as the CPO authorizes. evcc can only react after its next poll cycle (10-30 seconds of unwanted charging).
-
-## Making the sniffer reachable
-
-Your charger connects over WSS with a valid TLS certificate. Use a **Cloudflare Tunnel**.
-
-```
-Charger ──wss──► ocpp.yourdomain.com  (Cloudflare edge, valid TLS)
-                        │
-                   Cloudflare Tunnel
-                        │
-                   HA host (LAN) :9000
-```
-
-### Step 1: Add your domain to Cloudflare
-
-Free plan works. Either transfer nameservers or register a new domain. If your domain is at another registrar: disable DNSSEC first, change nameservers to Cloudflare's, re-enable DNSSEC in Cloudflare after activation.
-
-### Step 2: Create a tunnel
-
-1. [one.dash.cloudflare.com](https://one.dash.cloudflare.com) > **Networks > Tunnels > Create**
-2. Connector: **Cloudflared**. Name: anything. Click **Save**.
-3. Copy the tunnel token (`eyJ...`).
-
-### Step 3: Install Cloudflared add-on in HA
-
-1. HA: **Settings > Add-ons > Add-on Store > ⋮ > Repositories**
-2. Add: `https://github.com/homeassistant-apps/repository`
-3. Install **Cloudflared**. Set config:
-   ```yaml
-   tunnel_token: "eyJ...your token..."
-   ```
-4. Start. Cloudflare dashboard shows tunnel as **Connected**.
-
-### Step 4: Add public hostname
-
-Cloudflare Zero Trust > **Tunnels > your tunnel > Configure > Public Hostname > Add**:
-
-| Field | Value |
-|---|---|
-| Subdomain | `ocpp` |
-| Domain | `yourdomain.com` |
-| Type | `HTTP` |
-| URL | `SNIFFER_CONTAINER_IP:9000` |
-
-Find the sniffer container IP:
-```bash
-docker inspect addon_XXXXX_ocpp-proxy \
-  --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
-```
-
-### Step 5: Point your charger at the sniffer
-
-| Setting | Value |
-|---|---|
-| OCPP URL | `wss://ocpp.yourdomain.com/charger` |
-| Identity | your charger serial number |
-| Password | your `charger_password` |
-
 ## REST API
-
-Available at `http://SNIFFER_IP:9000`.
 
 ### Read
 
-| Endpoint | Description |
+| Endpoint | Returns |
 |---|---|
-| `GET /charger_info` | RFID tag, status, vendor, firmware |
-| `GET /meter_values` | L1/L2/L3 voltage, current, power, energy |
-| `GET /last_session` | Last session: idTag, energy, stop reason |
+| `GET /charger_info` | `{"connected", "evcc_status", "last_id_tag", "last_status", "vendor", "model", "firmware", "serial"}` |
+| `GET /meter_values` | `{"power_w", "energy_wh", "current_l1/l2/l3", "voltage_l1/l2/l3", "timestamp"}` |
+| `GET /last_session` | `{"id_tag", "transaction_id", "start_time", "stop_time", "energy_wh", "stop_reason"}` |
+| `GET /status` | `{"charger_connected", "upstream"}` |
 | `GET /data_transfer` | Last 20 vendor DataTransfer messages |
-| `GET /status` | Upstream URL, connection state |
-| `GET /sessions` | All sessions (JSON) |
-| `GET /sessions.csv` | All sessions (CSV) |
+| `GET /sessions` | All completed sessions (JSON) |
+| `GET /sessions.csv` | All completed sessions (CSV) |
 
 ### Commands
 
-| Endpoint | OCPP command | Description |
-|---|---|---|
-| `POST /enable/true` | `SetChargingProfile` | Resume charging at `min_current` amps |
-| `POST /enable/false` | `SetChargingProfile` | Pause charging (0A) |
-| `POST /maxcurrent/{amps}` | `SetChargingProfile` | Set max current |
-| `POST /command` | any | `{"action":"...","payload":{...}}` |
+| Endpoint | Effect |
+|---|---|
+| `POST /enable/true` | Resume charging at `min_current` amps |
+| `POST /enable/false` | Pause charging (0A) |
+| `POST /maxcurrent/{amps}` | Set max current |
+| `POST /command` | Raw OCPP: `{"action":"...","payload":{...}}` |
 
-## evcc config
+## evcc custom charger config
+
+Paste this in the evcc UI custom charger YAML field. Replace `SNIFFER_IP` with your container IP.
 
 ```yaml
-chargers:
-  - name: wallbox
-    type: custom
-
-    status:
-      source: http
-      uri: http://SNIFFER_IP:9000/charger_info
-      jq: .evcc_status
-
-    enabled:
-      source: http
-      uri: http://SNIFFER_IP:9000/charger_info
-      jq: .last_status != "Unavailable"
-
-    enable:
-      source: http
-      uri: http://SNIFFER_IP:9000/enable/{{.enable}}
-      method: POST
-
-    maxcurrent:
-      source: http
-      uri: http://SNIFFER_IP:9000/maxcurrent/{{.maxcurrent}}
-      method: POST
-
-    power:
-      source: http
-      uri: http://SNIFFER_IP:9000/meter_values
-      jq: .power_w
-
-    energy:
-      source: http
-      uri: http://SNIFFER_IP:9000/meter_values
-      jq: .energy_wh / 1000
-
-    identify:
-      source: http
-      uri: http://SNIFFER_IP:9000/charger_info
-      jq: .last_id_tag
-
-    currents:
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .current_l1
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .current_l2
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .current_l3
-
-    voltages:
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .voltage_l1
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .voltage_l2
-      - source: http
-        uri: http://SNIFFER_IP:9000/meter_values
-        jq: .voltage_l3
+status:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .evcc_status
+enabled:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .last_status != "Unavailable"
+enable:
+  source: http
+  uri: http://SNIFFER_IP:9000/enable/{{.enable}}
+  method: POST
+maxcurrent:
+  source: http
+  uri: http://SNIFFER_IP:9000/maxcurrent/{{.maxcurrent}}
+  method: POST
+power:
+  source: http
+  uri: http://SNIFFER_IP:9000/meter_values
+  jq: .power_w
+energy:
+  source: http
+  uri: http://SNIFFER_IP:9000/meter_values
+  jq: .energy_wh / 1000
+identify:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .last_id_tag
+currents:
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l1
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l2
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l3
+voltages:
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l1
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l2
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l3
 ```
-
-Replace `SNIFFER_IP` with your sniffer container IP.
 
 ## Vehicle identification
 
-```yaml
-vehicles:
-  - name: polestar4
-    type: polestar
-    identifiers:
-      - 97BA7F51
-```
-
-### Finding your RFID tag
-
-1. Point charger at sniffer.
-2. Plug in your car (tag appears in `StartTransaction`).
-3. `GET /charger_info` → `.last_id_tag`.
+Add your RFID tag to the vehicle's identifiers in evcc. Find your tag by plugging in and checking `GET /charger_info` → `last_id_tag`.
 
 ## Notes
 
 **One upstream only.** No multi-backend support.
 
-**Local auth.** CPOs using `SendLocalList` authorize locally. The idTag still appears in `StartTransaction` at plug-in.
+**Local auth.** CPOs using `SendLocalList` authorize locally. The idTag appears in `StartTransaction` at plug-in, not at RFID tap.
 
 **MeterValues.** Returns zeros until a charging session starts.
 
 **BootNotification.** Vendor/model/firmware populate on full power cycle only.
 
-**Tested with.** Wallbox Pulsar Pro + Wattify CPO. Other OCPP 1.6 chargers and CPOs should work but are untested.
+**Tested with.** Wallbox Pulsar Pro + Wattify CPO.
 
 ## License
 
