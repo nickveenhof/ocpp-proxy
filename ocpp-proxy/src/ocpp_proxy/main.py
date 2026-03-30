@@ -21,6 +21,18 @@ _charger_info: dict = {
     "last_status": None,
 }
 
+_meter_values: dict = {
+    "energy_wh": None,
+    "power_w": None,
+    "current_l1": None,
+    "current_l2": None,
+    "current_l3": None,
+    "voltage_l1": None,
+    "voltage_l2": None,
+    "voltage_l3": None,
+    "timestamp": None,
+}
+
 
 @web.middleware
 async def log_all_requests(request, handler):
@@ -56,6 +68,31 @@ def _sniff(raw: str) -> None:
             _charger_info["model"] = payload.get("chargePointModel")
         if action == "StatusNotification":
             _charger_info["last_status"] = payload.get("status")
+        if action == "MeterValues":
+            for mv in payload.get("meterValue", []):
+                ts = mv.get("timestamp")
+                if ts:
+                    _meter_values["timestamp"] = ts
+                for sv in mv.get("sampledValue", []):
+                    measurand = sv.get("measurand", "")
+                    phase = sv.get("phase", "")
+                    value = sv.get("value")
+                    if measurand == "Energy.Active.Import.Register":
+                        _meter_values["energy_wh"] = float(value)
+                    elif measurand == "Power.Active.Import":
+                        _meter_values["power_w"] = float(value)
+                    elif measurand == "Current.Import" and phase == "L1":
+                        _meter_values["current_l1"] = float(value)
+                    elif measurand == "Current.Import" and phase == "L2":
+                        _meter_values["current_l2"] = float(value)
+                    elif measurand == "Current.Import" and phase == "L3":
+                        _meter_values["current_l3"] = float(value)
+                    elif measurand == "Voltage" and phase == "L1-N":
+                        _meter_values["voltage_l1"] = float(value)
+                    elif measurand == "Voltage" and phase == "L2-N":
+                        _meter_values["voltage_l2"] = float(value)
+                    elif measurand == "Voltage" and phase == "L3-N":
+                        _meter_values["voltage_l3"] = float(value)
     except Exception:
         pass
 
@@ -188,12 +225,17 @@ async def charger_info_handler(request: web.Request) -> web.Response:
     return web.json_response(_charger_info.copy())
 
 
+async def meter_values_handler(request: web.Request) -> web.Response:
+    return web.json_response(_meter_values.copy())
+
+
 async def welcome_handler(_request: web.Request) -> web.Response:
     html = """<!DOCTYPE html>
-<html><head><title>OCPP Transparent Proxy</title></head><body>
-<h1>OCPP Transparent Proxy</h1>
+<html><head><title>OCPP Sniffer</title></head><body>
+<h1>OCPP Sniffer</h1>
 <ul>
   <li><a href="/charger_info">/charger_info</a> - last idTag and charger state</li>
+  <li><a href="/meter_values">/meter_values</a> - latest L1/L2/L3 voltages, currents and power</li>
   <li><a href="/status">/status</a> - upstream and charger status</li>
   <li><a href="/sessions">/sessions</a> - completed sessions (JSON)</li>
   <li><a href="/sessions.csv">/sessions.csv</a> - completed sessions (CSV)</li>
@@ -218,6 +260,7 @@ async def init_app() -> web.Application:
             web.get("/sessions.csv", sessions_csv),
             web.get("/status", status_handler),
             web.get("/charger_info", charger_info_handler),
+            web.get("/meter_values", meter_values_handler),
         ]
     )
     return app
