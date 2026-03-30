@@ -1,272 +1,188 @@
-# OCPP Proxy - Multi-Version EV Charger Sharing
+# OCPP Sniffer
 
-A secure, lightweight OCPP proxy server designed as a Home Assistant add-on that enables intelligent EV charger sharing. Supports both **OCPP 1.6** and **OCPP 2.0.1** protocols with automatic version detection.
+Transparent OCPP 1.6 proxy for Home Assistant. Sits between your charger and your CPO. Forwards all traffic unchanged. Captures RFID tags and meter data for evcc.
 
-The proxy sits between a single EV charger and multiple backend services (energy providers, fleet management, charging networks), allowing multiple third-party services to use spare charger capacity while keeping the homeowner in full control.
+## The problem
 
-## ✨ Key Features
+Your charger is managed by a CPO for billing via OCPP. evcc cannot see who plugged in, so it cannot select the right vehicle or schedule.
 
-### 🔌 **Multi-Protocol Support**
-- **OCPP 1.6** and **OCPP 2.0.1** support with automatic version detection
-- WebSocket subprotocol negotiation and header-based version detection
-- Unified API across both protocol versions
+## The solution
 
-### 🏠 **Homeowner Control**
-- User maintains full control and can override any backend at any time
-- Smart arbitration with configurable rules and preferences
-- Home Assistant integration for monitoring and manual overrides
+```
+Charger ──wss──► OCPP Sniffer ──wss──► CPO  (billing unchanged)
+                      │
+                      ├── /charger_info   RFID tag, status
+                      ├── /meter_values   power, energy, L1/L2/L3
+                      ├── /enable/{bool}  pause/resume (SetChargingProfile)
+                      └── /maxcurrent/N   set current (SetChargingProfile)
+evcc ──HTTP──► OCPP Sniffer
+```
 
-### ⚡ **Intelligent Sharing**
-- Single charger connection supports multiple backend subscribers
-- Real-time event broadcasting to all connected services
-- Automatic control arbitration with safety-first design
+## Install
 
-### 🔗 **Dual Connection Types**
-- **WebSocket Backends**: Traditional services connect to the proxy
-- **OCPP Service Clients**: Proxy connects outbound to OCPP services
-- Both types compete for control using the same arbitration rules
+1. HA: **Settings > Add-ons > Add-on Store > ⋮ > Repositories**
+2. Add: `https://github.com/nickveenhof/ocpp-sniffer`
+3. Install **OCPP Sniffer**.
 
-### 🛡️ **Safety & Security**
-- Automatic safety controls prevent conflicts and handle charger faults
-- Rate limiting and provider filtering (allowlist/blocklist support)
-- Charger fault detection automatically revokes backend control
+## Config
 
-### 📊 **Monitoring & Analytics**
-- Session tracking with SQLite persistence
-- Revenue tracking for different providers
-- CSV export functionality via REST API
-- Real-time status monitoring via Home Assistant
+In the add-on Configuration tab, fill in:
 
-## 🚀 Installation
+| Field | What to enter |
+|---|---|
+| upstream_url | Your CPO OCPP URL, e.g. `wss://cpo.example.com/ocpp/123456` |
+| charger_password | A password. Set the same in your charger's OCPP settings. |
+| min_current | Minimum charge current in amps. Default: `6`. |
+| auto_throttle | `true` (default). Sets 0A on plug-in. evcc controls when to start. |
 
-### Home Assistant Add-on (Recommended)
+## Auto-throttle
 
-#### Via Add-on Store
-1. In Home Assistant, go to **Settings** → **Add-ons**
-2. Click the **Add-on Store** tab
-3. Click the **⋮** menu (three dots) in the top right corner
-4. Select **Repositories**
-5. Add repository URL: `https://github.com/smartenergycontrol-be/ocpp-proxy`
-6. Click **Add**
-7. Refresh the add-on store page
-8. Search for "OCPP Proxy" or browse the available add-ons
-9. Click on "OCPP Proxy" and then **Install**
-10. Configure options via the add-on **Configuration** tab
-11. Start the add-on from the **Info** tab
+When enabled, the sniffer sets 0A immediately after `StartTransaction`. The CPO session starts (billing runs), but the charger draws no power. evcc decides when to charge via `/enable/true`.
 
-#### Manual Installation
-1. SSH into your Home Assistant instance
-2. Navigate to `/addons` directory
-3. Clone this repository: `git clone https://github.com/smartenergycontrol-be/ocpp-proxy.git`
-4. Restart Home Assistant
-5. The add-on will appear in your local add-ons list
+Without it, the charger starts at full power on plug-in. evcc reacts after 10-30 seconds.
 
-### Standalone (Docker Compose)
+## What gets captured
+
+| OCPP message | Data | Endpoint |
+|---|---|---|
+| `BootNotification` | Vendor, model, firmware, serial | `/charger_info` |
+| `StatusNotification` | Status (A/B/C for evcc) | `/charger_info` |
+| `Authorize` | RFID idTag | `/charger_info` |
+| `StartTransaction` | RFID idTag, meter start | `/charger_info`, `/last_session` |
+| `StopTransaction` | Meter stop, energy, stop reason | `/last_session` |
+| `MeterValues` | L1/L2/L3 voltage, current, power, energy | `/meter_values` |
+| `DataTransfer` | Vendor messages (last 20) | `/data_transfer` |
+
+## REST API
+
+### Read
+
+| Endpoint | Returns |
+|---|---|
+| `GET /charger_info` | `{connected, evcc_status, last_id_tag, last_status, vendor, model, firmware, serial}` |
+| `GET /meter_values` | `{power_w, energy_wh, current_l1/l2/l3, voltage_l1/l2/l3, timestamp}` |
+| `GET /last_session` | `{id_tag, transaction_id, start_time, stop_time, energy_wh, stop_reason}` |
+| `GET /status` | `{charger_connected, upstream}` |
+| `GET /data_transfer` | Last 20 vendor DataTransfer messages |
+| `GET /sessions` | All completed sessions (JSON) |
+| `GET /sessions.csv` | All completed sessions (CSV) |
+
+### Commands
+
+| Endpoint | Effect |
+|---|---|
+| `POST /enable/true` | Resume charging at `min_current` amps |
+| `POST /enable/false` | Pause charging (0A) |
+| `POST /maxcurrent/{amps}` | Set max current |
+| `POST /command` | Raw OCPP: `{"action":"...","payload":{...}}` |
+
+## evcc custom charger config
+
+Paste in the evcc UI custom charger YAML field. Replace `SNIFFER_IP` with your container IP.
+
 ```yaml
-version: '3'
-services:
-  ocpp_proxy:
-    build: .
-    environment:
-      - HA_URL=http://homeassistant.local:8123
-      - HA_TOKEN=YOUR_LONG_LIVED_ACCESS_TOKEN
-    ports:
-      - '9000:9000'
-    volumes:
-      - ./config:/data
+status:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .evcc_status
+enabled:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .last_status != "Unavailable"
+enable:
+  source: http
+  uri: http://SNIFFER_IP:9000/enable/{{.enable}}
+  method: POST
+maxcurrent:
+  source: http
+  uri: http://SNIFFER_IP:9000/maxcurrent/{{.maxcurrent}}
+  method: POST
+power:
+  source: http
+  uri: http://SNIFFER_IP:9000/meter_values
+  jq: .power_w
+energy:
+  source: http
+  uri: http://SNIFFER_IP:9000/meter_values
+  jq: .energy_wh / 1000
+identify:
+  source: http
+  uri: http://SNIFFER_IP:9000/charger_info
+  jq: .last_id_tag
+currents:
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l1
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l2
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .current_l3
+voltages:
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l1
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l2
+  - source: http
+    uri: http://SNIFFER_IP:9000/meter_values
+    jq: .voltage_l3
 ```
 
-### Development Setup
-```bash
-# Install dependencies
-pip install -r requirements.txt
+## Vehicle identification
 
-# Run tests
-make test
+Add your RFID tag to the vehicle's identifiers in evcc. Find your tag by plugging in and checking `GET /charger_info` → `last_id_tag`.
 
-# Start development server
-make run
-```
+## Charger setup (Cloudflare Tunnel)
 
-## ⚙️ Configuration
-
-### Basic Configuration (YAML)
-```yaml
-# OCPP Protocol Settings
-ocpp_version: "1.6"              # Default version (1.6 or 2.0.1)
-auto_detect_ocpp_version: true   # Auto-detect from connection
-
-# Sharing Control
-allow_shared_charging: true
-preferred_provider: "energy_provider_1"
-rate_limit_seconds: 10
-
-# Home Assistant Integration
-presence_sensor: "binary_sensor.someone_home"
-override_input_boolean: "input_boolean.charger_override"
-
-# Provider Management
-allowed_providers: ["provider1", "provider2"]  # Optional allowlist
-blocked_providers: ["spammer"]                 # Optional blocklist
-
-# OCPP Services (Outbound Connections)
-ocpp_services:
-  - id: "energy_provider"
-    url: "ws://provider.com/ocpp"
-    version: "1.6"
-    auth_type: "basic"
-    username: "user"
-    password: "pass"
-    enabled: true
-  
-  - id: "fleet_service"
-    url: "wss://fleet.com/ocpp/cp001"
-    version: "2.0.1"
-    auth_type: "token"
-    token: "bearer_token_here"
-    enabled: true
-```
-
-### Version Detection
-The proxy automatically detects OCPP versions through:
-- WebSocket subprotocol (`ocpp1.6`, `ocpp2.0.1`)
-- HTTP headers (`Sec-WebSocket-Protocol`, `X-OCPP-Version`)
-- URL query parameters (`?version=2.0.1`)
-- URL path patterns (`/charger/v2.0.1`)
-
-## 🔌 API Endpoints
-
-### WebSocket Endpoints
-- **`/charger`** - EV charger connection (CSMS role)
-  - Auto-detects OCPP version
-  - Supports query parameters: `?version=2.0.1`
-- **`/backend?id=backend_id`** - Backend service connections
-  - Custom protocol for control requests and event subscriptions
-
-### REST API
-- **`GET /`** - Web interface with endpoint documentation
-- **`GET /sessions`** - Charging sessions as JSON
-- **`GET /sessions.csv`** - Charging sessions as CSV
-- **`GET /status`** - Backend status and current control owner
-- **`POST /override`** - Manual control override
-
-## 🏗️ Architecture
-
-### Core Components
+Your charger connects over WSS with a valid TLS cert. Use a Cloudflare Tunnel.
 
 ```
-src/ocpp_proxy/
-├── main.py                    # Application entry point & HTTP server
-├── charge_point_base.py       # Abstract base for version-agnostic interface
-├── charge_point_v16.py        # OCPP 1.6 implementation
-├── charge_point_v201.py       # OCPP 2.0.1 implementation
-├── charge_point_factory.py    # Version-specific instantiation
-├── backend_manager.py         # Multi-backend control arbitration
-├── ocpp_service_manager.py    # Outbound OCPP service connections
-├── config.py                  # Configuration management
-├── ha_bridge.py              # Home Assistant API integration
-└── logger.py                 # Session tracking & persistence
+Charger ──wss──► ocpp.yourdomain.com  (Cloudflare, valid TLS)
+                        │
+                   Cloudflare Tunnel
+                        │
+                   HA host (LAN) :9000
 ```
 
-### Protocol Differences Handled
-- **OCPP 1.6**: `RemoteStartTransaction`, `StartTransaction`/`StopTransaction`
-- **OCPP 2.0.1**: `RequestStartTransaction`, `TransactionEvent` (Started/Ended)
-- Automatic message format conversion and enum handling
+### 1. Add your domain to Cloudflare
 
-### Control Flow
-1. **Connection**: Charger connects → Version detected → Appropriate handler created
-2. **Registration**: Multiple backends subscribe to events and request control
-3. **Arbitration**: Smart control arbitration based on rules and preferences
-4. **Safety**: Automatic fault handling and user override capabilities
+Free plan. Transfer nameservers from your registrar. Disable DNSSEC first if enabled, re-enable in Cloudflare after activation.
 
-## 🧪 Testing
+### 2. Create a tunnel
 
-```bash
-# Run all tests
-make test
+[one.dash.cloudflare.com](https://one.dash.cloudflare.com) > **Networks > Tunnels > Create**. Connector: Cloudflared. Copy the token.
 
-# Run specific test types
-make test-unit         # Unit tests only
-make test-integration  # Integration tests only
-make test-e2e         # End-to-end tests only
+### 3. Install Cloudflared add-on in HA
 
-# Coverage reporting
-make test-coverage     # Generate HTML coverage report
-```
+Add repository `https://github.com/homeassistant-apps/repository`. Install Cloudflared. Set `tunnel_token` in config. Start.
 
-Test coverage requirement: **85% minimum**
+### 4. Add public hostname
 
-## 🔧 Development Commands
+Cloudflare Zero Trust > **Tunnels > Configure > Public Hostname > Add**: subdomain `ocpp`, domain `yourdomain.com`, type `HTTP`, URL `SNIFFER_CONTAINER_IP:9000`.
 
-```bash
-# Development
-make run              # Start development server
-make clean           # Clean temporary files
+### 5. Point charger at sniffer
 
-# Testing
-make test            # Run full test suite
-make test-quick      # Quick unit tests only
+| Setting | Value |
+|---|---|
+| OCPP URL | `wss://ocpp.yourdomain.com/charger` |
+| Identity | your charger serial number |
+| Password | same as `charger_password` |
 
-# Quality
-make lint            # Code linting (when configured)
-make format          # Code formatting (when configured)
+## Notes
 
-# Docker
-make docker-build    # Build Docker image
-make docker-run      # Run in container
-```
+**One upstream only.** No multi-backend support.
 
-## 📊 Use Cases
+**Local auth.** CPOs using `SendLocalList` authorize locally. The idTag appears in `StartTransaction` at plug-in, not at RFID tap.
 
-### Primary Scenario
-Homeowner with EV charger wants to:
-- Allow energy providers to use spare capacity during off-peak rates
-- Let fleet services use charger for delivery vehicles during work hours
-- Provide public access through charging networks when on vacation
-- Maintain full control with Home Assistant automation
+**MeterValues.** Returns zeros until a charging session starts.
 
-### Example Integrations
-- **Energy Providers**: Smart charging during cheap electricity periods
-- **Fleet Management**: Scheduled charging for commercial vehicles  
-- **Charging Networks**: Revenue sharing through public access
-- **Home Automation**: Presence-based blocking and smart overrides
+**BootNotification.** Vendor/model/firmware populate on full power cycle only.
 
-## 🛡️ Safety Features
+**Tested with.** Wallbox Pulsar Pro + Wattify CPO.
 
-- **Fault Handling**: Charger faults immediately revoke all backend control
-- **Conflict Prevention**: Only one backend can control charger simultaneously
-- **User Override**: Always possible via Home Assistant interface
-- **Rate Limiting**: Prevents spam requests from backends
-- **Provider Filtering**: Allowlist/blocklist support for security
+## License
 
-## 📈 Future Roadmap
-
-### OCPP 2.1 Support (2025 H2)
-- Bidirectional charging (V2G) support
-- Distributed Energy Resource (DER) control
-- Enhanced payment integration
-- Battery swapping support
-
-### Planned Features
-- Advanced pricing APIs
-- Multi-charger support
-- Enhanced authentication mechanisms
-- Real-time analytics dashboard
-
-## 📄 License
-
-Open source - check license file for details.
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-1. Run tests: `make test`
-2. Follow existing code style
-3. Add tests for new features
-4. Update documentation
-
-## 🔗 Links
-
-- [OCPP 1.6 Specification](https://openchargealliance.org/protocols/ocpp-16/)
-- [OCPP 2.0.1 Specification](https://openchargealliance.org/protocols/ocpp-201/)
-- [Home Assistant Add-on Development](https://developers.home-assistant.io/docs/add-ons/)
+MIT
