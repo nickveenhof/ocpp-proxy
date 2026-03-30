@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import csv
 import io
 import json
 import logging
 import os
+import time
+import uuid
 
 import websockets
 from aiohttp import WSCloseCode, web
@@ -19,6 +22,8 @@ _charger_info: dict = {
     "model": None,
     "last_id_tag": None,
     "last_status": None,
+    "firmware": None,
+    "serial": None,
 }
 
 _meter_values: dict = {
@@ -32,6 +37,27 @@ _meter_values: dict = {
     "voltage_l3": None,
     "timestamp": None,
 }
+
+_last_session: dict = {
+    "id_tag": None,
+    "transaction_id": None,
+    "start_time": None,
+    "stop_time": None,
+    "meter_start_wh": None,
+    "meter_stop_wh": None,
+    "energy_wh": None,
+    "stop_reason": None,
+}
+
+_data_transfer_log: list = []
+
+_active_charger_ws = None
+_pending_responses: dict = {}
+
+
+_api_token: str = ""
+
+EXEMPT_PATHS = {"/charger", "/"}
 
 
 @web.middleware
@@ -51,23 +77,86 @@ async def log_all_requests(request, handler):
     return await handler(request)
 
 
+@web.middleware
+async def auth_middleware(request, handler):
+    if not _api_token:
+        return await handler(request)
+    path = request.path
+    if path in EXEMPT_PATHS or path.startswith("/charger/"):
+        return await handler(request)
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token != _api_token:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
+
+
 def _sniff(raw: str) -> None:
     try:
         msg = json.loads(raw)
         if not isinstance(msg, list) or len(msg) < 3:
             return
+        msg_type = msg[0]
         action = msg[2] if len(msg) > 2 else ""
         payload = msg[3] if len(msg) > 3 else {}
+
+        if msg_type == 3:
+            msg_id = msg[1]
+            if msg_id in _pending_responses:
+                _pending_responses[msg_id]["response"] = msg
+                _pending_responses[msg_id]["event"].set()
+            return
+
         if action in ("Authorize", "StartTransaction"):
             id_tag = payload.get("idTag") or payload.get("id_tag")
             if id_tag:
                 _charger_info["last_id_tag"] = id_tag
                 _LOGGER.info("Captured idTag=%s from %s", id_tag, action)
+            if action == "StartTransaction":
+                _last_session["id_tag"] = id_tag
+                _last_session["start_time"] = payload.get("timestamp")
+                _last_session["meter_start_wh"] = payload.get("meterStart")
+                _last_session["stop_time"] = None
+                _last_session["stop_reason"] = None
+                _last_session["energy_wh"] = None
+
         if action == "BootNotification":
             _charger_info["vendor"] = payload.get("chargePointVendor")
             _charger_info["model"] = payload.get("chargePointModel")
+            _charger_info["firmware"] = payload.get("firmwareVersion")
+            _charger_info["serial"] = payload.get("chargePointSerialNumber")
+
         if action == "StatusNotification":
             _charger_info["last_status"] = payload.get("status")
+
+        if action == "StopTransaction":
+            meter_stop = payload.get("meterStop")
+            _last_session["stop_time"] = payload.get("timestamp")
+            _last_session["meter_stop_wh"] = meter_stop
+            _last_session["stop_reason"] = payload.get("reason", "Unknown")
+            if _last_session["meter_start_wh"] is not None and meter_stop is not None:
+                _last_session["energy_wh"] = meter_stop - _last_session["meter_start_wh"]
+            id_tag = payload.get("idTag") or payload.get("id_tag") or _last_session.get("id_tag")
+            _last_session["id_tag"] = id_tag
+            _LOGGER.info(
+                "StopTransaction: idTag=%s energy=%s Wh reason=%s",
+                id_tag,
+                _last_session["energy_wh"],
+                _last_session["stop_reason"],
+            )
+
+        if action == "DataTransfer":
+            entry = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "vendorId": payload.get("vendorId"),
+                "messageId": payload.get("messageId"),
+                "data": payload.get("data"),
+            }
+            _data_transfer_log.append(entry)
+            if len(_data_transfer_log) > 100:
+                _data_transfer_log.pop(0)
+            _LOGGER.info("DataTransfer: %s", entry)
+
         if action == "MeterValues":
             for mv in payload.get("meterValue", []):
                 ts = mv.get("timestamp")
@@ -77,6 +166,8 @@ def _sniff(raw: str) -> None:
                     measurand = sv.get("measurand", "")
                     phase = sv.get("phase", "")
                     value = sv.get("value")
+                    if value is None:
+                        continue
                     if measurand == "Energy.Active.Import.Register":
                         _meter_values["energy_wh"] = float(value)
                     elif measurand == "Power.Active.Import":
@@ -107,13 +198,30 @@ async def _connect_upstream(url: str):
 
 
 async def charger_handler(request: web.Request) -> web.WebSocketResponse:
+    global _active_charger_ws
+    config = request.app["config"]
+
+    if config.charger_password:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode()
+                _, _, provided_password = decoded.partition(":")
+            except Exception:
+                provided_password = ""
+        else:
+            provided_password = ""
+        if provided_password != config.charger_password:
+            _LOGGER.warning("Charger connection rejected: wrong password from %s", request.remote)
+            return web.Response(status=401, text="Unauthorized")
+
     ws = web.WebSocketResponse(protocols=("ocpp1.6", "ocpp2.0.1"))
     await ws.prepare(request)
 
-    config = request.app["config"]
     upstream_url = config.ocpp_services[0].get("url") if config.ocpp_services else None
 
     _charger_info["connected"] = True
+    _active_charger_ws = ws
     _LOGGER.info("Charger connected. Upstream: %s", upstream_url or "none")
 
     upstream_ws = None
@@ -159,6 +267,7 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
         try:
             async for raw in u_ws:
                 _LOGGER.info("UPSTREAM -> CHARGER: %s", raw)
+                _sniff(raw)
                 try:
                     await ws.send_str(raw)
                 except Exception:
@@ -175,11 +284,101 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
         _LOGGER.exception("Proxy error")
     finally:
         _charger_info["connected"] = False
+        _active_charger_ws = None
         await pending_charger_msgs.put(None)
         if upstream_ws:
             await upstream_ws.close()
         await ws.close(code=WSCloseCode.GOING_AWAY)
     return ws
+
+
+async def _send_to_charger(action: str, payload: dict, timeout: float = 10.0) -> dict:
+    if not _active_charger_ws:
+        raise RuntimeError("No charger connected")
+    msg_id = str(uuid.uuid4())
+    msg = json.dumps([2, msg_id, action, payload])
+    event = asyncio.Event()
+    _pending_responses[msg_id] = {"event": event, "response": None}
+    try:
+        await _active_charger_ws.send_str(msg)
+        _LOGGER.info("INJECTED -> CHARGER: %s", msg)
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+        return _pending_responses[msg_id]["response"]
+    finally:
+        _pending_responses.pop(msg_id, None)
+
+
+async def command_handler(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    action = body.get("action")
+    payload = body.get("payload", {})
+
+    if not action:
+        return web.json_response({"error": "action required"}, status=400)
+
+    if not _active_charger_ws:
+        return web.json_response({"error": "no charger connected"}, status=503)
+
+    try:
+        response = await _send_to_charger(action, payload)
+        return web.json_response({"action": action, "response": response})
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "charger did not respond"}, status=504)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def enable_handler(request: web.Request) -> web.Response:
+    enable = request.match_info.get("enable", "true").lower() == "true"
+    action = "RemoteStartTransaction" if enable else "RemoteStopTransaction"
+    if not _active_charger_ws:
+        return web.json_response({"error": "no charger connected"}, status=503)
+    try:
+        if enable:
+            payload = {"connectorId": 1, "idTag": _charger_info.get("last_id_tag") or "evcc"}
+        else:
+            payload = {"transactionId": _last_session.get("transaction_id", 1)}
+        response = await _send_to_charger(action, payload)
+        return web.json_response({"action": action, "response": response})
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "charger did not respond"}, status=504)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def maxcurrent_handler(request: web.Request) -> web.Response:
+    try:
+        amps = int(request.match_info["amps"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "amps required"}, status=400)
+    if not _active_charger_ws:
+        return web.json_response({"error": "no charger connected"}, status=503)
+    try:
+        payload = {
+            "connectorId": 1,
+            "csChargingProfiles": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxDefaultProfile",
+                "chargingProfileKind": "Absolute",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": amps}],
+                },
+            },
+        }
+        response = await _send_to_charger("SetChargingProfile", payload)
+        return web.json_response(
+            {"action": "SetChargingProfile", "amps": amps, "response": response}
+        )
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "charger did not respond"}, status=504)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def sessions_json(request: web.Request) -> web.Response:
@@ -229,25 +428,53 @@ async def meter_values_handler(request: web.Request) -> web.Response:
     return web.json_response(_meter_values.copy())
 
 
+async def last_session_handler(request: web.Request) -> web.Response:
+    return web.json_response(_last_session.copy())
+
+
+async def data_transfer_handler(request: web.Request) -> web.Response:
+    return web.json_response(_data_transfer_log[-20:])
+
+
 async def welcome_handler(_request: web.Request) -> web.Response:
     html = """<!DOCTYPE html>
 <html><head><title>OCPP Sniffer</title></head><body>
 <h1>OCPP Sniffer</h1>
+<h2>Read endpoints</h2>
 <ul>
-  <li><a href="/charger_info">/charger_info</a> - last idTag and charger state</li>
-  <li><a href="/meter_values">/meter_values</a> - latest L1/L2/L3 voltages, currents and power</li>
-  <li><a href="/status">/status</a> - upstream and charger status</li>
-  <li><a href="/sessions">/sessions</a> - completed sessions (JSON)</li>
-  <li><a href="/sessions.csv">/sessions.csv</a> - completed sessions (CSV)</li>
+  <li><a href="/charger_info">/charger_info</a> - idTag, status, vendor, firmware</li>
+  <li><a href="/meter_values">/meter_values</a> - L1/L2/L3 voltage, current, power, energy</li>
+  <li><a href="/last_session">/last_session</a> - last completed charging session</li>
+  <li><a href="/data_transfer">/data_transfer</a> - vendor DataTransfer messages (last 20)</li>
+  <li><a href="/status">/status</a> - upstream URL and connection state</li>
+  <li><a href="/sessions">/sessions</a> - all sessions JSON</li>
+  <li><a href="/sessions.csv">/sessions.csv</a> - all sessions CSV</li>
+</ul>
+<h2>Command endpoints (POST)</h2>
+<ul>
+  <li>POST /enable/true - RemoteStartTransaction</li>
+  <li>POST /enable/false - RemoteStopTransaction</li>
+  <li>POST /maxcurrent/{amps} - SetChargingProfile</li>
+  <li>POST /command - raw OCPP command {"action":"...","payload":{...}}</li>
 </ul>
 </body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
 async def init_app() -> web.Application:
+    global _api_token
     config = Config()
+    _api_token = config.api_token
+    if _api_token:
+        _LOGGER.info("API token configured: auth required on all non-charger endpoints")
+    else:
+        _LOGGER.warning("No API token set: all REST endpoints are public")
+    if config.charger_password:
+        _LOGGER.info("Charger password configured: only authenticated chargers accepted")
+    else:
+        _LOGGER.warning("No charger password set: any charger can connect")
 
-    app = web.Application(middlewares=[log_all_requests])
+    app = web.Application(middlewares=[log_all_requests, auth_middleware])
     app["config"] = config
     app["event_logger"] = EventLogger(db_path=os.getenv("LOG_DB_PATH", "usage_log.db"))
 
@@ -261,6 +488,11 @@ async def init_app() -> web.Application:
             web.get("/status", status_handler),
             web.get("/charger_info", charger_info_handler),
             web.get("/meter_values", meter_values_handler),
+            web.get("/last_session", last_session_handler),
+            web.get("/data_transfer", data_transfer_handler),
+            web.post("/enable/{enable}", enable_handler),
+            web.post("/maxcurrent/{amps}", maxcurrent_handler),
+            web.post("/command", command_handler),
         ]
     )
     return app

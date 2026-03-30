@@ -30,14 +30,16 @@ Wallbox ──wss──► OCPP Sniffer ──wss──► Wattify (CPO)
 ## Configuration
 
 ```yaml
-ocpp_services:
-  - id: "wattify"
-    url: "wss://cpo.wattify.be/ocpp/YOUR_SERIAL"
-    auth_type: "none"
-    enabled: true
+upstream_url: "wss://cpo.wattify.be/ocpp/YOUR_SERIAL"
+api_token: "your-secret-token"
+charger_password: "your-charger-password"
 ```
 
-All other settings are optional and unused in transparent proxy mode.
+| Field | Required | Description |
+|---|---|---|
+| `upstream_url` | Yes | Your CPO OCPP endpoint (e.g. Wattify) |
+| `api_token` | Recommended | Bearer token for all REST endpoints. Set the same value in evcc `http` source headers. |
+| `charger_password` | Recommended | OCPP Basic Auth password. Set the same value in the Wallbox app OCPP password field. Rejects any charger connection without this password. |
 
 ## Charger setup
 
@@ -51,14 +53,30 @@ Point your charger's OCPP URL to the proxy instead of your CPO:
 
 ## REST API
 
+All endpoints except `/charger` require `Authorization: Bearer <api_token>` when `api_token` is set.
+
+### Read endpoints
+
 | Endpoint | Description |
 |---|---|
-| `GET /charger_info` | Last captured idTag and charger state. Poll this from EVCC. |
-| `GET /status` | Upstream URL and charger connection state |
-| `GET /sessions` | Completed sessions with idTag (JSON) |
-| `GET /sessions.csv` | Completed sessions (CSV) |
+| `GET /charger_info` | idTag, status, vendor, firmware, serial |
+| `GET /meter_values` | L1/L2/L3 voltage, current, power, energy (Wh) |
+| `GET /last_session` | Last completed session: idTag, energy, duration, stop reason |
+| `GET /data_transfer` | Last 20 vendor DataTransfer messages |
+| `GET /status` | Upstream URL and connection state |
+| `GET /sessions` | All completed sessions (JSON) |
+| `GET /sessions.csv` | All completed sessions (CSV) |
 
-### `/charger_info` response example
+### Command endpoints
+
+| Endpoint | Description |
+|---|---|
+| `POST /enable/true` | RemoteStartTransaction |
+| `POST /enable/false` | RemoteStopTransaction |
+| `POST /maxcurrent/{amps}` | SetChargingProfile (e.g. `/maxcurrent/16`) |
+| `POST /command` | Raw OCPP: `{"action":"ChangeAvailability","payload":{...}}` |
+
+### `/charger_info` example
 
 ```json
 {
@@ -66,7 +84,25 @@ Point your charger's OCPP URL to the proxy instead of your CPO:
   "vendor": "Wall Box Chargers",
   "model": "PPR1-0-2-4",
   "last_id_tag": "97BA7F51",
-  "last_status": "Preparing"
+  "last_status": "Preparing",
+  "firmware": "6.11.16",
+  "serial": "1305884"
+}
+```
+
+### `/meter_values` example
+
+```json
+{
+  "energy_wh": 111335.0,
+  "power_w": 7400.0,
+  "current_l1": 10.5,
+  "current_l2": 10.5,
+  "current_l3": 10.4,
+  "voltage_l1": 235.0,
+  "voltage_l2": 229.0,
+  "voltage_l3": 230.0,
+  "timestamp": "2026-03-30T14:00:00Z"
 }
 ```
 

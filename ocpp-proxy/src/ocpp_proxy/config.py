@@ -30,6 +30,14 @@ class Config:
         return str(self._cfg.get("upstream_url", ""))
 
     @property
+    def api_token(self) -> str:
+        return str(self._cfg.get("api_token", ""))
+
+    @property
+    def charger_password(self) -> str:
+        return str(self._cfg.get("charger_password", ""))
+
+    @property
     def ocpp_services(self) -> list[dict]:
         url = self.upstream_url
         if url:
