@@ -1,6 +1,10 @@
+import json
+import logging
 import os
 
 import yaml
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Config:
@@ -9,14 +13,21 @@ class Config:
     """
 
     def __init__(self, path: str | None = None):
-        # Home Assistant add-on options are stored in /data/options.yaml by default
         default_path = os.getenv("ADDON_CONFIG_FILE", "/data/options.yaml")
         config_path = path or default_path
-        try:
+        json_path = config_path.replace(".yaml", ".json")
+        self._cfg: dict = {}
+        if os.path.exists(config_path):
             with open(config_path) as f:
                 self._cfg = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            self._cfg = {}
+            _LOGGER.info("Loaded config from %s", config_path)
+        elif os.path.exists(json_path):
+            with open(json_path) as f:
+                self._cfg = json.load(f)
+            _LOGGER.info("Loaded config from %s", json_path)
+        else:
+            _LOGGER.warning("No config file found at %s or %s", config_path, json_path)
+        _LOGGER.info("Config: ocpp_services=%s", self._cfg.get("ocpp_services", []))
 
     @property
     def allow_shared_charging(self) -> bool:
@@ -45,7 +56,7 @@ class Config:
     @property
     def disallowed_providers(self) -> list[str]:
         """Return list of provider IDs that are always blocked.
-        
+
         (deprecated: use blocked_providers)
         """
         return self.blocked_providers
