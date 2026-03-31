@@ -249,6 +249,8 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
         await asyncio.sleep(1)
         _charging_enabled = False
         try:
+            _LOGGER.info("AUTO-THROTTLE: clearing all charging profiles")
+            await _send_to_charger("ClearChargingProfile", {"connectorId": 1})
             _LOGGER.info("AUTO-THROTTLE: setting current to 0A")
             await _send_to_charger(
                 "SetChargingProfile",
