@@ -59,6 +59,51 @@ _min_current: int = 6
 _charging_enabled: bool = False
 _max_current_amps: int = 6
 
+_STATE_FILE = os.getenv("STATE_FILE", "/data/sniffer_state.json")
+
+
+def _save_state():
+    try:
+        state = {
+            "last_id_tag": _charger_info["last_id_tag"],
+            "vendor": _charger_info["vendor"],
+            "model": _charger_info["model"],
+            "firmware": _charger_info["firmware"],
+            "serial": _charger_info["serial"],
+            "last_session": _last_session,
+            "charging_enabled": _charging_enabled,
+            "max_current_amps": _max_current_amps,
+        }
+        with open(_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        _LOGGER.exception("Failed to save state")
+
+
+def _load_state():
+    global _charging_enabled, _max_current_amps
+    try:
+        if not os.path.exists(_STATE_FILE):
+            return
+        with open(_STATE_FILE) as f:
+            state = json.load(f)
+        _charger_info["last_id_tag"] = state.get("last_id_tag", "")
+        _charger_info["vendor"] = state.get("vendor", "unknown")
+        _charger_info["model"] = state.get("model", "unknown")
+        _charger_info["firmware"] = state.get("firmware", "unknown")
+        _charger_info["serial"] = state.get("serial", "unknown")
+        _charger_info["connected"] = False
+        _last_session.update(state.get("last_session", {}))
+        _charging_enabled = state.get("charging_enabled", False)
+        _max_current_amps = state.get("max_current_amps", 6)
+        _LOGGER.info(
+            "Restored state: last_id_tag=%s charging_enabled=%s",
+            _charger_info["last_id_tag"],
+            _charging_enabled,
+        )
+    except Exception:
+        _LOGGER.exception("Failed to load state")
+
 
 @web.middleware
 async def log_all_requests(request, handler):
@@ -99,6 +144,7 @@ def _sniff(raw: str) -> str:
             if id_tag:
                 _charger_info["last_id_tag"] = id_tag
                 _LOGGER.info("Captured idTag=%s from %s", id_tag, action)
+                _save_state()
             if action == "StartTransaction":
                 _last_session["id_tag"] = id_tag
                 _last_session["start_time"] = payload.get("timestamp")
@@ -106,6 +152,7 @@ def _sniff(raw: str) -> str:
                 _last_session["stop_time"] = None
                 _last_session["stop_reason"] = None
                 _last_session["energy_wh"] = None
+                _save_state()
                 return "start"
 
         if action == "BootNotification":
@@ -151,6 +198,7 @@ def _sniff(raw: str) -> str:
                 _last_session["energy_wh"],
                 _last_session["stop_reason"],
             )
+            _save_state()
 
         if action == "DataTransfer":
             entry = {
@@ -379,6 +427,7 @@ async def enable_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "no charger connected"}, status=503)
     try:
         _charging_enabled = enable
+        _save_state()
         limit = _max_current_amps if enable else 0
         payload = {
             "connectorId": 1,
@@ -415,6 +464,7 @@ async def maxcurrent_handler(request: web.Request) -> web.Response:
     except (KeyError, ValueError):
         return web.json_response({"error": "amps required"}, status=400)
     _max_current_amps = amps
+    _save_state()
     if not _active_charger_ws:
         return web.json_response({"error": "no charger connected"}, status=503)
     if not _charging_enabled:
@@ -541,6 +591,7 @@ async def init_app() -> web.Application:
     config = Config()
     _auto_throttle = config.auto_throttle
     _min_current = config.min_current
+    _load_state()
     if _auto_throttle:
         _LOGGER.info(
             "Auto-throttle enabled: charger set to 0A on StartTransaction, evcc controls via /enable"
