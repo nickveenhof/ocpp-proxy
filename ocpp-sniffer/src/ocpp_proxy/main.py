@@ -125,6 +125,7 @@ async def log_all_requests(request, handler):
 
 def _sniff(raw: str) -> str:
     """Sniff OCPP messages. Returns 'start' for StartTransaction, 'charging' for StatusNotification:Charging, '' otherwise."""
+    global _charging_enabled
     try:
         msg = json.loads(raw)
         if not isinstance(msg, list) or len(msg) < 3:
@@ -190,6 +191,10 @@ def _sniff(raw: str) -> str:
                 "Faulted": "F",
                 "Unavailable": "A",
             }.get(ocpp_status, "A")
+            if ocpp_status == "Available" and _charging_enabled:
+                _charging_enabled = False
+                _LOGGER.info("Session ended: reset charging_enabled to False")
+                _save_state()
             if ocpp_status == "Charging" and not _charging_enabled:
                 return "charging"
 
@@ -311,6 +316,12 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     async def throttle_to_zero():
         global _charging_enabled
         await asyncio.sleep(1)
+        if _charging_enabled:
+            _LOGGER.info(
+                "AUTO-THROTTLE: skipped (evcc already enabled at %dA)",
+                _max_current_amps,
+            )
+            return
         _charging_enabled = False
         try:
             _LOGGER.info("AUTO-THROTTLE: clearing all charging profiles")
@@ -344,6 +355,21 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
             sniff_result = _sniff(msg.data)
             if sniff_result in ("start", "charging") and _auto_throttle:
                 asyncio.create_task(throttle_to_zero())
+            try:
+                parsed = json.loads(msg.data)
+                if (
+                    isinstance(parsed, list)
+                    and len(parsed) >= 2
+                    and parsed[0] == 3
+                    and parsed[1] in _pending_responses
+                ):
+                    _LOGGER.info(
+                        "FILTERED: not forwarding injected response %s to upstream",
+                        parsed[1],
+                    )
+                    continue
+            except (json.JSONDecodeError, TypeError):
+                pass
             await pending_charger_msgs.put(msg.data)
 
     async def upstream_relay():
@@ -441,6 +467,17 @@ async def enable_handler(request: web.Request) -> web.Response:
     enable = request.match_info.get("enable", "true").lower() == "true"
     if not _active_charger_ws:
         return web.json_response({"error": "no charger connected"}, status=503)
+    if enable == _charging_enabled:
+        _LOGGER.info("enable=%s: no change, skipping SetChargingProfile", enable)
+        return web.json_response(
+            {
+                "action": "SetChargingProfile",
+                "enable": enable,
+                "limit_amps": _max_current_amps if enable else 0,
+                "sent": False,
+                "reason": "no_change",
+            }
+        )
     try:
         _charging_enabled = enable
         _save_state()
@@ -464,6 +501,7 @@ async def enable_handler(request: web.Request) -> web.Response:
                 "action": "SetChargingProfile",
                 "enable": enable,
                 "limit_amps": limit,
+                "sent": True,
                 "response": response,
             }
         )
