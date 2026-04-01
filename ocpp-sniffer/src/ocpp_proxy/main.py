@@ -179,7 +179,14 @@ def _sniff(raw: str) -> str:
             _charger_info["serial"] = payload.get("chargePointSerialNumber")
 
         if action == "StatusNotification":
+            connector_id = payload.get("connectorId", 1)
             ocpp_status = payload.get("status", "")
+            if connector_id == 0:
+                _LOGGER.info(
+                    "StatusNotification connectorId=0 status=%s (charger-level, ignored for evcc)",
+                    ocpp_status,
+                )
+                return ""
             _charger_info["last_status"] = ocpp_status
             _charger_info["evcc_status"] = {
                 "Available": "A",

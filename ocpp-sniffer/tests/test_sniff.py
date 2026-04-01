@@ -537,3 +537,29 @@ class TestAvailableResetsChargingEnabled:
         )
         result = _sniff(msg)
         assert result == ""
+
+    def test_connector_zero_available_does_not_reset(self):
+        main_mod._charging_enabled = True
+        msg = json.dumps(
+            [
+                2,
+                "1",
+                "StatusNotification",
+                {"connectorId": 0, "errorCode": "NoError", "status": "Available"},
+            ]
+        )
+        _sniff(msg)
+        assert main_mod._charging_enabled is True
+
+    def test_connector_zero_ignored_for_evcc_status(self):
+        _charger_info["evcc_status"] = "C"
+        msg = json.dumps(
+            [
+                2,
+                "1",
+                "StatusNotification",
+                {"connectorId": 0, "errorCode": "NoError", "status": "Available"},
+            ]
+        )
+        _sniff(msg)
+        assert _charger_info["evcc_status"] == "C"
